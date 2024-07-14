@@ -18,7 +18,7 @@ fn main() {
     let mut audio_resampler = audio_decoder
         .resampler(
             ffmpeg::format::Sample::F32(ffmpeg::format::sample::Type::Planar),
-            audio_decoder.channel_layout(),
+            ffmpeg::ChannelLayout::STEREO,
             audio_decoder.rate(),
         )
         .unwrap();
@@ -26,7 +26,7 @@ fn main() {
     let mut input_frame = ffmpeg::util::frame::Audio::empty();
     let mut output_frame = ffmpeg::util::frame::Audio::empty();
 
-    let mut audio_samples: Vec<f32> = Vec::new();
+    let mut audio_samples: [Vec<f32>; 2] = [Vec::new(), Vec::new()];
 
     for (stream, packet) in input.packets() {
         if stream.id() == audio_stream_id {
@@ -36,17 +36,8 @@ fn main() {
                     .run(&input_frame, &mut output_frame)
                     .unwrap();
 
-                let channel_count = output_frame.channels() as usize;
-                let sample_count = output_frame.samples();
-                let mut mixed_samples = vec![0.0; sample_count];
-
-                for i in 0..channel_count {
-                    let sample_data = output_frame.plane::<f32>(i);
-                    for i in 0..sample_count {
-                        mixed_samples[i] += sample_data[i] / channel_count as f32;
-                    }
-                }
-                audio_samples.extend_from_slice(&mixed_samples);
+                audio_samples[0].extend_from_slice(&output_frame.plane::<f32>(0));
+                audio_samples[1].extend_from_slice(&output_frame.plane::<f32>(1));
             }
         }
     }
@@ -58,35 +49,49 @@ fn main() {
     let mut output = ffmpeg::format::output("test.mp3").unwrap();
 
     let codec = ffmpeg::encoder::find(ffmpeg::codec::Id::MP3).unwrap();
-    let stream = output.add_stream(codec).unwrap();
+    let mut stream = output.add_stream(codec).unwrap();
 
-    let mut encoder = stream.codec().encoder().audio().unwrap();
+    let context = ffmpeg::codec::context::Context::new();
+    let mut encoder = context.encoder().audio().unwrap();
     encoder.set_rate(audio_decoder.rate() as i32);
-    encoder.set_channel_layout(ffmpeg::ChannelLayout::MONO);
-    encoder.set_channels(1);
+    encoder.set_channel_layout(ffmpeg::ChannelLayout::STEREO);
+    encoder.set_channels(2);
     encoder.set_bit_rate(128_000);
-    encoder.set_format(ffmpeg::format::Sample::F32(
-        ffmpeg::format::sample::Type::Planar,
-    ));
+    encoder.set_format(ffmpeg::format::Sample::F32(ffmpeg::format::sample::Type::Planar));
+
+    let mut encoder = encoder.open_as(codec).unwrap();
+
+    stream.set_parameters(&encoder);
 
     output.write_header().unwrap();
 
-    let mut frame = ffmpeg::util::frame::Audio::new(
-        ffmpeg::format::Sample::F32(ffmpeg::format::sample::Type::Planar),
-        audio_samples.len(),
-        ffmpeg::ChannelLayout::MONO,
-    );
-    frame.plane_mut(0).copy_from_slice(audio_samples.as_slice());
+    let frame_size = 1152;
+    let mut samples_output = 0;
 
-    encoder.send_frame(&frame).unwrap();
+    for chunk in audio_samples[0].chunks(frame_size).zip(audio_samples[1].chunks(frame_size)) {
+        let mut frame = ffmpeg::util::frame::Audio::new(
+            ffmpeg::format::Sample::F32(ffmpeg::format::sample::Type::Planar),
+            frame_size,
+            ffmpeg::ChannelLayout::STEREO,
+        );
+        frame.plane_mut(0).copy_from_slice(&chunk.0);
+        frame.plane_mut(1).copy_from_slice(&chunk.1);
+        frame.set_pts(Some(samples_output as i64));
 
-    let mut packet = ffmpeg::Packet::empty();
-    while encoder.receive_packet(&mut packet).is_ok() {
-        packet.set_stream(0);
-        packet.write(&mut output).unwrap();
+        encoder.send_frame(&frame).unwrap();
+
+        let mut packet = ffmpeg::Packet::empty();
+        while encoder.receive_packet(&mut packet).is_ok() {
+            packet.set_stream(0);
+            packet.write(&mut output).unwrap();
+        }
+
+        samples_output += chunk.0.len();
     }
 
     encoder.send_eof().unwrap();
+
+    let mut packet = ffmpeg::Packet::empty();
     while encoder.receive_packet(&mut packet).is_ok() {
         packet.set_stream(0);
         packet.write(&mut output).unwrap();
